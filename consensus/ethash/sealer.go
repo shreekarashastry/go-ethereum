@@ -30,6 +30,60 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+func (ethash *Ethash) SealRandomData(chain consensus.ChainReader, data []byte, stop <-chan struct{}) (int, error) {
+	// If we're running a shared PoW, delegate sealing to it
+	if ethash.shared != nil {
+		return ethash.shared.SealRandomData(chain, data, stop)
+	}
+	// Create a runner and the multiple search threads it directs
+	abort := make(chan struct{})
+	found := make(chan *types.Block)
+
+	ethash.lock.Lock()
+	threads := ethash.threads
+	if ethash.rand == nil {
+		seed, err := crand.Int(crand.Reader, big.NewInt(math.MaxInt64))
+		if err != nil {
+			ethash.lock.Unlock()
+			return 0, err
+		}
+		ethash.rand = rand.New(rand.NewSource(seed.Int64()))
+	}
+	ethash.lock.Unlock()
+	if threads == 0 {
+		threads = runtime.NumCPU()
+	}
+	if threads < 0 {
+		threads = 0 // Allows disabling local mining without extra logic around local/remote
+	}
+	var pend sync.WaitGroup
+	for i := 0; i < threads; i++ {
+		pend.Add(1)
+		go func(id int, nonce uint64) {
+			defer pend.Done()
+			ethash.mineRandomData(data, id, nonce, abort, found)
+		}(i, uint64(ethash.rand.Int63()))
+	}
+	// Wait until sealing is terminated or a nonce is found
+	var result *types.Block
+	select {
+	case <-stop:
+		// Outside abort, stop all miner threads
+		close(abort)
+	case result = <-found:
+		// One of the threads found a block, abort all others
+		close(abort)
+	case <-ethash.update:
+		// Thread count was changed on user request, restart
+		close(abort)
+		pend.Wait()
+		return ethash.SealRandomData(chain, data, stop)
+	}
+	// Wait for all miners to terminate and return the block
+	pend.Wait()
+	return result, nil
+}
+
 // Seal implements consensus.Engine, attempting to find a nonce that satisfies
 // the block's difficulty requirements.
 func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, stop <-chan struct{}) (*types.Block, error) {
@@ -90,6 +144,56 @@ func (ethash *Ethash) Seal(chain consensus.ChainReader, block *types.Block, stop
 	// Wait for all miners to terminate and return the block
 	pend.Wait()
 	return result, nil
+}
+
+func (ethash *Ethash) mineRandomData(data []byte, id int, seed uint64, abort chan struct{}) {
+	// Extract some data from the header
+	var (
+		target  = new(big.Int).Div(maxUint256, big.NewInt(1000000000000000000)) // Setting the difficulty to a very high number because we only want to measure the hash rate
+		number  = uint64(1)                                                     // running on the first epoch
+		dataset = ethash.dataset(number)
+	)
+	// Start generating random nonces until we abort or find a good one
+	var (
+		attempts = int64(0)
+		nonce    = seed
+	)
+	logger := log.New("miner", id)
+	logger.Trace("Started ethash search for new nonces", "seed", seed)
+search:
+	for {
+		select {
+		case <-abort:
+			// Mining terminated, update stats and abort
+			logger.Trace("Ethash nonce search aborted", "attempts", nonce-seed)
+			ethash.hashrate.Mark(attempts)
+			break search
+
+		default:
+			// We don't have to update hash rate on every nonce, so update after after 2^X nonces
+			attempts++
+			if (attempts % (1 << 15)) == 0 {
+				ethash.hashrate.Mark(attempts)
+				attempts = 0
+			}
+			// increase the number of hashes done at every iteration
+			ethash.numHashes++
+			// Compute the PoW value of this nonce
+			_, result := hashimotoFull(dataset.dataset, data, nonce)
+			if new(big.Int).SetBytes(result).Cmp(target) <= 0 {
+				// Seal and return a block (if still needed)
+				select {
+				case <-abort:
+					logger.Trace("Ethash nonce found but discarded", "attempts", nonce-seed, "nonce", nonce)
+				}
+				break search
+			}
+			nonce++
+		}
+	}
+	// Datasets are unmapped in a finalizer. Ensure that the dataset stays live
+	// during sealing so it's not unmapped while being read.
+	runtime.KeepAlive(dataset)
 }
 
 // mine is the actual proof-of-work miner that searches for a nonce starting from

@@ -409,6 +409,8 @@ type Ethash struct {
 	fakeDelay time.Duration // Time delay to sleep for before returning from verify
 
 	lock sync.Mutex // Ensures thread safety for the in-memory caches and mining fields
+
+	numHashes int
 }
 
 // New creates a full sized ethash PoW scheme.
@@ -424,12 +426,21 @@ func New(config Config) *Ethash {
 		log.Info("Disk storage enabled for ethash DAGs", "dir", config.DatasetDir, "count", config.DatasetsOnDisk)
 	}
 	return &Ethash{
-		config:   config,
-		caches:   newlru("cache", config.CachesInMem, newCache),
-		datasets: newlru("dataset", config.DatasetsInMem, newDataset),
-		update:   make(chan struct{}),
-		hashrate: metrics.NewMeter(),
+		config:    config,
+		caches:    newlru("cache", config.CachesInMem, newCache),
+		datasets:  newlru("dataset", config.DatasetsInMem, newDataset),
+		update:    make(chan struct{}),
+		hashrate:  metrics.NewMeter(),
+		numHashes: 0,
 	}
+}
+
+func (ethash *Ethash) SetNumHashes(numHashes int) {
+	ethash.numHashes = numHashes
+}
+
+func (ethash *Ethash) NumHashes() int {
+	return ethash.numHashes
 }
 
 // NewTester creates a small sized ethash PoW scheme useful only for testing
